@@ -48,5 +48,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="README.md" />
+    <None Include=".gitignore" />
+    <None Include=".github\workflows\build.yml" />
   </ItemGroup>
 </Project>
