@@ -1,8 +1,6 @@
 # Intelligent Search Scope Expander
 
-# Intelligent Search Scope Expander
-
-This application was created as an **experiment** to understand what should be the ideal method of scope expansion for local file searchability on Windows that is grounded on user activity signals. Rather than indexing the entire filesystem, the app observes which files and folders the user actually interacts with — via File Explorer history, Quick Access pins, and application jumplists — and uses those signals to build a focused, user-activity-driven search scope. The goal is to explore whether this approach produces a more relevant and efficient set of searchable locations than a blanket full-disk index.
+This application was created as an **experiment** to understand what should be the ideal method of scope expansion for local file searchability on Windows that is grounded on user activity signals. Rather than indexing the entire filesystem, the app observes which files and folders the user actually interacts with â€” via File Explorer history, Quick Access pins, and application jumplists â€” and uses those signals to build a focused, user-activity-driven search scope. The goal is to explore whether this approach produces a more relevant and efficient set of searchable locations than a blanket full-disk index.
 
 The app is a Windows desktop application that automatically discovers and maintains a list of **Search Folders** based on the user's file activity. It starts minimized in the system tray and continuously monitors the user's recent file and folder usage to build and expand a comprehensive folder index.
 
@@ -14,9 +12,9 @@ The app is a Windows desktop application that automatically discovers and mainta
 
 On first launch, the app scans three categories of Windows Shell data to discover which files and folders the user actively works with:
 
-1. **File Explorer MRU (Most Recently Used)** — the shortcuts in the user's `Recent` folder
-2. **File Explorer Folder Jumplist / Quick Access** — pinned and frequent folders accessible via the shell namespace
-3. **Application Jumplists** — recent/pinned items from **Word, Excel, PowerPoint, Notepad, and Copilot** only (other applications are intentionally excluded to keep the scope focused on productivity signals)
+1. **File Explorer MRU (Most Recently Used)** â€” the shortcuts in the user's `Recent` folder
+2. **File Explorer Folder Jumplist / Quick Access** â€” pinned and frequent folders accessible via the shell namespace
+3. **Application Jumplists** â€” recent/pinned items from **Word, Excel, PowerPoint, Notepad, and Copilot** only (other applications are intentionally excluded to keep the scope focused on productivity signals)
 
 For every discovered file path, the app extracts the **parent folder**. For every discovered folder path, it uses the folder directly. It then recursively enumerates **all subfolders** of each parent and adds them to the Search Folders list.
 
@@ -29,7 +27,7 @@ The app uses a **light-themed UI** with the Segoe UI font and standard Windows c
 | Element | Behavior |
 |---|---|
 | **System tray icon** | Always present while the app is running. Double-click to open the window. Right-click for a context menu with *Open* and *Exit*. |
-| **Main window** | Standard light window with buttons, a checkbox, and a tree view control. The close (X) button **minimizes to tray** — it does not exit the app. |
+| **Main window** | Standard light window with buttons, a checkbox, and a tree view control. The close (X) button **minimizes to tray** â€” it does not exit the app. |
 | **"Show Search Folders" button** | First click: displays the tree view and changes its label to **"Refresh Search Folders"**. Subsequent clicks: re-collects folders from all sources and refreshes the tree. |
 | **"Show OneDrive Folders" checkbox** | Toggles visibility of OneDrive-synced folders in the tree. Checked by default. Unchecking immediately hides all paths containing `OneDrive` from the tree (without removing them from the database). |
 | **"Add to Windows Search Scope" button** | Adds all discovered folders to the Windows Search Indexer's crawl scope using the CrawlScopeManager COM API. OneDrive folders are always excluded from this operation. Shows a confirmation dialog before proceeding, then reports how many folders were added vs. skipped. |
@@ -73,9 +71,9 @@ Every time a **new** parent folder is discovered, the app appends a line to:
 Format: `[YYYY-MM-DD HH:MM:SS] <source>: <folder path>`
 
 Source labels:
-- `FE MRU` — File Explorer Most Recently Used (Recent folder `.lnk` files)
-- `FE Folder Jumplist` — File Explorer Quick Access / Links folder / Explorer taskbar jumplist
-- `Application Jumplist` — Word, Excel, PowerPoint, Notepad, Copilot only
+- `FE MRU` â€” File Explorer Most Recently Used (Recent folder `.lnk` files)
+- `FE Folder Jumplist` â€” File Explorer Quick Access / Links folder / Explorer taskbar jumplist
+- `Application Jumplist` â€” Word, Excel, PowerPoint, Notepad, Copilot only
 
 ---
 
@@ -106,12 +104,12 @@ The entire application is implemented in a single C++ source file (`Intelligent 
 
 ```
 wWinMain
-  ?? CoInitializeEx (STA — required for Shell COM objects)
+  ?? CoInitializeEx (STA â€” required for Shell COM objects)
   ?? OleInitialize (full OLE support for shell operations)
   ?? InitCommonControlsEx (TreeView control registration)
   ?? MyRegisterClass (WNDCLASSEX with app icon)
-  ?? InitInstance (SW_HIDE — starts hidden)
-       ?? CreateWindowW (main window, 800×600)
+  ?? InitInstance (SW_HIDE â€” starts hidden)
+       ?? CreateWindowW (main window, 800Ã—600)
        ?? Create "Show Search Folders" button
        ?? Create TreeView control (initially hidden)
        ?? InitTrayIcon (NOTIFYICONDATA ? Shell_NotifyIcon)
@@ -183,7 +181,7 @@ A dedicated thread polls every **30 seconds**:
 
 ```
 MonitorThreadProc
-  ?? CoInitializeEx (STA — each thread needs its own COM init)
+  ?? CoInitializeEx (STA â€” each thread needs its own COM init)
   ?? Loop:
   ?    ?? Sleep(30000)
   ?    ?? Check g_stopMonitor flag
@@ -194,7 +192,7 @@ MonitorThreadProc
   ?? CoUninitialize
 ```
 
-Since `AddFolderRecursive()` skips folders already in the set, repeated polls are efficient — only genuinely new folders cause filesystem enumeration.
+Since `AddFolderRecursive()` skips folders already in the set, repeated polls are efficient â€” only genuinely new folders cause filesystem enumeration.
 
 Thread synchronization uses a `std::mutex` (`g_folderMutex`) protecting all reads/writes to `g_searchFolders`.
 
@@ -221,7 +219,7 @@ The database is a simple binary file at:
 
 The tree view identifies **top-level folders**: any folder in `g_searchFolders` that meets one of these criteria:
 - Its parent directory is not in `g_searchFolders`
-- Its parent is a drive root (e.g., `C:\`) — direct children of drive roots are promoted to top-level since drive roots themselves are excluded as non-meaningful entries
+- Its parent is a drive root (e.g., `C:\`) â€” direct children of drive roots are promoted to top-level since drive roots themselves are excluded as non-meaningful entries
 - It has no parent (edge case)
 
 Bare drive roots (like `c:`) are always excluded from the tree.
@@ -238,10 +236,10 @@ On expand (`TVN_ITEMEXPANDING`), the full path is read directly from the tree it
 
 | Action | Result |
 |---|---|
-| Tray double-click | `RestoreFromTray()` — `ShowWindow(SW_SHOW)` + `SetForegroundWindow()` |
-| Tray right-click | `ShowTrayContextMenu()` — popup menu with **Open** and **Exit** |
-| Window close (X) | `MinimizeToTray()` — `ShowWindow(SW_HIDE)` (does NOT exit) |
-| Menu ? Exit or Tray ? Exit | `DoExit()` — stops monitor thread, saves database, removes tray icon, destroys window |
+| Tray double-click | `RestoreFromTray()` â€” `ShowWindow(SW_SHOW)` + `SetForegroundWindow()` |
+| Tray right-click | `ShowTrayContextMenu()` â€” popup menu with **Open** and **Exit** |
+| Window close (X) | `MinimizeToTray()` â€” `ShowWindow(SW_HIDE)` (does NOT exit) |
+| Menu ? Exit or Tray ? Exit | `DoExit()` â€” stops monitor thread, saves database, removes tray icon, destroys window |
 
 ### Data Flow Diagram
 
