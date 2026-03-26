@@ -35,11 +35,14 @@ bool g_firstShowDone = false;
 bool g_exiting = false;
 bool g_showOneDrive = true;
 
-std::set<std::wstring> g_searchFolders;
+std::map<std::wstring, FILETIME> g_searchFolders; // folder path -> last-seen timestamp
 std::mutex g_folderMutex;
 HANDLE g_monitorThread = nullptr;
 volatile bool g_stopMonitor = false;
 std::vector<std::wstring*> g_treeItemPaths;
+
+// Scope decay: folders not seen within this many days are pruned on save
+static const DWORD SCOPE_DECAY_DAYS = 30;
 
 // UI resources
 static HFONT  g_hFontUI = nullptr;       // Segoe UI font
@@ -228,6 +231,16 @@ void LogFolderSource(const std::wstring& folder, const wchar_t* source)
 }
 
 // ---------------------------------------------------------------------------
+// Helper: get current time as FILETIME
+// ---------------------------------------------------------------------------
+static FILETIME GetCurrentFileTime()
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return ft;
+}
+
+// ---------------------------------------------------------------------------
 // Helper: expand environment variables in a path
 // ---------------------------------------------------------------------------
 std::wstring ExpandEnvPath(const std::wstring& path)
@@ -300,11 +313,33 @@ void SaveDatabase()
     FILE* f = nullptr;
     _wfopen_s(&f, path.c_str(), L"wb");
     if (!f) return;
-    for (auto& folder : g_searchFolders)
+
+    // Compute cutoff time for scope decay
+    FILETIME ftNow;
+    GetSystemTimeAsFileTime(&ftNow);
+    ULARGE_INTEGER cutoff;
+    cutoff.LowPart = ftNow.dwLowDateTime;
+    cutoff.HighPart = ftNow.dwHighDateTime;
+    // Subtract SCOPE_DECAY_DAYS in 100-nanosecond intervals
+    cutoff.QuadPart -= (ULONGLONG)SCOPE_DECAY_DAYS * 24ULL * 60ULL * 60ULL * 10000000ULL;
+
+    // v2 format: magic header "ISSEF2\0\0" (8 bytes), then records with FILETIME
+    const char magic[8] = { 'I','S','S','E','F','2','\0','\0' };
+    fwrite(magic, 1, 8, f);
+
+    for (auto& kv : g_searchFolders)
     {
-        DWORD len = (DWORD)folder.size();
+        // Prune stale entries: skip folders not seen within the decay window
+        ULARGE_INTEGER lastSeen;
+        lastSeen.LowPart = kv.second.dwLowDateTime;
+        lastSeen.HighPart = kv.second.dwHighDateTime;
+        if (lastSeen.QuadPart < cutoff.QuadPart)
+            continue;
+
+        DWORD len = (DWORD)kv.first.size();
         fwrite(&len, sizeof(DWORD), 1, f);
-        fwrite(folder.c_str(), sizeof(wchar_t), len, f);
+        fwrite(kv.first.c_str(), sizeof(wchar_t), len, f);
+        fwrite(&kv.second, sizeof(FILETIME), 1, f);
     }
     fclose(f);
 }
@@ -316,14 +351,42 @@ void LoadDatabase()
     _wfopen_s(&f, path.c_str(), L"rb");
     if (!f) return;
     std::lock_guard<std::mutex> lock(g_folderMutex);
-    while (true)
+
+    // Detect format: read first 8 bytes to check for v2 magic header
+    char header[8] = {};
+    size_t headerRead = fread(header, 1, 8, f);
+    bool isV2 = (headerRead == 8 && memcmp(header, "ISSEF2\0\0", 8) == 0);
+
+    if (!isV2)
     {
-        DWORD len = 0;
-        if (fread(&len, sizeof(DWORD), 1, f) != 1) break;
-        if (len > 32768) break;
-        std::wstring folder(len, L'\0');
-        if (fread(&folder[0], sizeof(wchar_t), len, f) != len) break;
-        g_searchFolders.insert(folder);
+        // v1 format (legacy): no header, records are [DWORD len][wchar_t[] path]
+        // Rewind to start since the first bytes are part of the first record
+        fseek(f, 0, SEEK_SET);
+        FILETIME ftNow = GetCurrentFileTime();
+        while (true)
+        {
+            DWORD len = 0;
+            if (fread(&len, sizeof(DWORD), 1, f) != 1) break;
+            if (len > 32768) break;
+            std::wstring folder(len, L'\0');
+            if (fread(&folder[0], sizeof(wchar_t), len, f) != len) break;
+            g_searchFolders[folder] = ftNow;
+        }
+    }
+    else
+    {
+        // v2 format: records are [DWORD len][wchar_t[] path][FILETIME lastSeen]
+        while (true)
+        {
+            DWORD len = 0;
+            if (fread(&len, sizeof(DWORD), 1, f) != 1) break;
+            if (len > 32768) break;
+            std::wstring folder(len, L'\0');
+            if (fread(&folder[0], sizeof(wchar_t), len, f) != len) break;
+            FILETIME ft = {};
+            if (fread(&ft, sizeof(FILETIME), 1, f) != 1) break;
+            g_searchFolders[folder] = ft;
+        }
     }
     fclose(f);
 }
@@ -622,7 +685,7 @@ static const wchar_t* GetJumplistAppTag(const std::wstring& filename)
         if (lower.find(entry.prefix) == 0)
             return entry.tag;
     }
-    return nullptr; // Not in the allowed set — skip this jumplist file
+    return nullptr; // Not in the allowed set ï¿½ skip this jumplist file
 }
 
 std::vector<TaggedPath> GetJumplistPaths()
@@ -757,8 +820,12 @@ void AddFolderRecursive(const std::wstring& folder)
     {
         std::lock_guard<std::mutex> lock(g_folderMutex);
         if (g_searchFolders.count(normalized))
-            return; // Already added, skip recursion
-        g_searchFolders.insert(normalized);
+        {
+            // Already present â€” refresh its last-seen timestamp
+            g_searchFolders[normalized] = GetCurrentFileTime();
+            return; // Skip recursion since subfolders are already added
+        }
+        g_searchFolders[normalized] = GetCurrentFileTime();
     }
 
     // Enumerate subfolders
@@ -812,7 +879,12 @@ void CollectSearchFolders()
         std::wstring norm = NormalizePath(folder);
         {
             std::lock_guard<std::mutex> lock(g_folderMutex);
-            if (g_searchFolders.count(norm)) return;
+            if (g_searchFolders.count(norm))
+            {
+                // Already known â€” refresh timestamp to prevent decay
+                g_searchFolders[norm] = GetCurrentFileTime();
+                return;
+            }
         }
         LogFolderSource(folder, source);
         AddFolderRecursive(folder);
@@ -876,12 +948,13 @@ void PopulateTreeView()
     // A folder is top-level if:
     //   - Its parent directory is not in g_searchFolders, OR
     //   - It has no parent (drive root like "c:"), OR
-    //   - Its parent is a drive root (like "c:") — we treat direct children
+    //   - Its parent is a drive root (like "c:") ï¿½ we treat direct children
     //     of drive roots as top-level since drive roots themselves are not
     //     meaningful search scope entries.
     std::vector<std::wstring> topLevel;
-    for (auto& f : g_searchFolders)
+    for (auto& kv : g_searchFolders)
     {
+        const auto& f = kv.first;
         if (IsDriveRoot(f)) continue;
         if (IsExcludedPath(f)) continue;
         if (!g_showOneDrive && IsOneDrivePath(f)) continue;
@@ -937,8 +1010,9 @@ void AddFolderToTree(HTREEITEM hParent, const std::wstring& path)
     // Find immediate children in our set
     std::wstring prefix = path + L"\\";
 
-    for (auto& f : g_searchFolders)
+    for (auto& kv : g_searchFolders)
     {
+        const auto& f = kv.first;
         if (f.size() <= prefix.size()) continue;
         if (f.substr(0, prefix.size()) != prefix) continue;
         std::wstring remainder = f.substr(prefix.size());
@@ -951,8 +1025,9 @@ void AddFolderToTree(HTREEITEM hParent, const std::wstring& path)
         // Check if this child has its own visible children
         std::wstring childPrefix = f + L"\\";
         int hasChildren = 0;
-        for (auto& cf : g_searchFolders)
+        for (auto& ckv : g_searchFolders)
         {
+            const auto& cf = ckv.first;
             if (cf.size() > childPrefix.size() && cf.substr(0, childPrefix.size()) == childPrefix)
             {
                 std::wstring childRem = cf.substr(childPrefix.size());
@@ -1183,8 +1258,9 @@ static void AddToWindowsSearchScope(HWND hWndParent)
 
     {
         std::lock_guard<std::mutex> lock(g_folderMutex);
-        for (auto& folder : g_searchFolders)
+        for (auto& kv : g_searchFolders)
         {
+            const auto& folder = kv.first;
             // Skip OneDrive folders
             if (IsOneDrivePath(folder))
             {
@@ -1213,7 +1289,7 @@ static void AddToWindowsSearchScope(HWND hWndParent)
                 continue;
             }
 
-            // Build file:/// URL — CrawlScopeManager expects file:/// URLs
+            // Build file:/// URL ï¿½ CrawlScopeManager expects file:/// URLs
             // with forward slashes and trailing slash for inclusion rules
             std::wstring fileUrl = checkUrl;
 
