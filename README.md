@@ -64,16 +64,77 @@ The folders are added as **user scope rules** (inclusion), which means they appe
 
 ### Source Logging
 
-Every time a **new** parent folder is discovered, the app appends a line to:
+Every time a candidate folder is evaluated, the app appends a detailed scoring entry to:
 ```
 %LOCALAPPDATA%\IntelligentSearchScopeExpander\source_log.txt
 ```
-Format: `[YYYY-MM-DD HH:MM:SS] <source>: <folder path>`
 
-Source labels:
+Each entry includes the folder path, the verdict from each scoring rule, the final decision (ACCEPTED/REJECTED), whether child folders will be recursed, and the reason. Example:
+
+```
+[2025-07-14 10:30:45] SCORING: c:\experiments\testindexerdata
+  Rule1 (User-Doc Ratio): 12/20 files = 60.0% -> NET-POSITIVE
+  Rule2 (Project Marker): NO
+  Rule3 (Hidden/Sys Ratio): 0/20 files = 0.0% -> N/A
+  Rule4 (Signal Strength): 3 distinct source(s) [FE MRU, FE MRU, Application Jumplist] -> NET-POSITIVE
+  Rule5 (User Content Root): NO -> N/A
+  DECISION: ACCEPTED | Recurse children: YES
+  Reason: Accepted: Rule1 net-positive (user-doc ratio 60% >= 30%)
+```
+
+Signal source labels:
 - `FE MRU` — File Explorer Most Recently Used (Recent folder `.lnk` files)
 - `FE Folder Jumplist` — File Explorer Quick Access / Links folder / Explorer taskbar jumplist
 - `Application Jumplist` — Word, Excel, PowerPoint, Notepad, Copilot only
+
+### Folder Scoring Engine
+
+Before a signal-discovered folder is added to the search scope, it is scored against five rules. **Rules 1, 2, and 3 operate on the total files across the folder and all its child folders recursively** — not just the top-level contents. This prevents a folder with clean top-level files but deep subtrees of binaries from getting a misleadingly high score. This recursive scan is capped at 30 levels of depth.
+
+#### Rule 1: User-Document File Ratio
+
+Calculates the percentage of files (across the folder and all descendants) with user-content extensions (`.doc`, `.docx`, `.pdf`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, `.txt`, `.md`, `.rtf`, `.csv`, `.jpg`, `.png`, `.mp4`, `.mp3`).
+
+| Ratio | Verdict | Meaning |
+|---|---|---|
+| ≥30% | **NET-POSITIVE** | Almost certainly worth indexing |
+| <30% | UNSURE | Folders with low user-document ratios are likely codebases, system folders, or binary dumps — but not rejected outright. Index if accompanied by another unsure or higher score from a different rule |
+
+#### Rule 2: Presence of Project Marker Files
+
+Recursively checks the folder and all descendants for `.git`, `.sln`, `.csproj`, `package.json`, `Cargo.toml`, `Makefile`, `CMakeLists.txt`, `.xcodeproj`, `go.mod`, `pyproject.toml`, `pom.xml`, `build.gradle`. If found anywhere in the subtree, the folder is a developer workspace — add only the **current folder** to the index, **not its children** (avoids indexing `node_modules`, `bin/`, `obj/`, etc.).
+
+#### Rule 3: Hidden/System File Ratio
+
+Calculates the percentage of files (across the folder and all descendants) with Hidden or System attributes.
+
+| Ratio | Verdict | Meaning |
+|---|---|---|
+| ≥50% | **NET-NEGATIVE** | Application-internal data store — reject |
+| 30% – <50% | UNSURE | Suspicious but not definitive |
+| <30% | N/A | No concern |
+
+#### Rule 4: Signal Strength / Recurrence
+
+Counts how many distinct signal sources (FE MRU, FE Folder Jumplist, Application Jumplist) point to the same folder.
+
+| Distinct sources | Verdict | Meaning |
+|---|---|---|
+| ≥3 | **NET-POSITIVE** | Very high confidence (also checks Rule 2 for recursion depth) |
+| 2 | UNSURE | Moderate confidence |
+| 1 | N/A | Single signal alone is not enough |
+
+#### Rule 5: User Content Root
+
+If the folder is under `C:\Users\` (but not under AppData, which is already excluded by the system folder filter), it receives an **UNSURE** vote — boosting it when combined with another unsure signal from a different rule.
+
+#### Decision Logic
+
+1. **Any NET-NEGATIVE** (Rule 3) → **REJECTED** immediately
+2. **Any NET-POSITIVE** (Rule 1 or Rule 4) → **ACCEPTED** immediately
+3. **≥2 UNSURE** votes from different rules → **ACCEPTED**
+4. **Project marker + ≥1 UNSURE** → **ACCEPTED** (folder only, no children)
+5. Otherwise → **REJECTED**
 
 ---
 

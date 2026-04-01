@@ -60,7 +60,6 @@ void RestoreFromTray(HWND hWnd);
 
 std::wstring GetDatabasePath();
 std::wstring GetLogPath();
-void LogFolderSource(const std::wstring& folder, const wchar_t* source);
 void SaveDatabase();
 void LoadDatabase();
 
@@ -88,6 +87,49 @@ static void ClearTreeItemPaths();
 static void InitUIResources();
 static void FreeUIResources();
 static void AddToWindowsSearchScope(HWND hWndParent);
+
+// ---------------------------------------------------------------------------
+// Scoring engine types
+// ---------------------------------------------------------------------------
+enum class ScoreVerdict { NetPositive, Unsure, NetNegative, NotApplicable };
+
+static const wchar_t* VerdictToString(ScoreVerdict v)
+{
+    switch (v) {
+    case ScoreVerdict::NetPositive:  return L"NET-POSITIVE";
+    case ScoreVerdict::Unsure:        return L"UNSURE";
+    case ScoreVerdict::NetNegative:  return L"NET-NEGATIVE";
+    case ScoreVerdict::NotApplicable: return L"N/A";
+    }
+    return L"?";
+}
+
+struct FolderScore {
+    std::wstring folder;
+    // Rule 1
+    int totalFiles;  int userDocFiles;  double userDocPct;
+    ScoreVerdict rule1;
+    // Rule 2
+    bool hasProjectMarker;  std::wstring markerName;
+    // Rule 3
+    int hiddenSysFiles;  double hiddenSysPct;
+    ScoreVerdict rule3;
+    // Rule 4
+    int signalCount;  std::vector<std::wstring> signalSources;
+    ScoreVerdict rule4;
+    // Rule 5
+    bool isUnderUserRoot;
+    ScoreVerdict rule5;
+    // Final
+    bool accepted;
+    bool recurseChildren; // false if project marker folder
+    std::wstring reason;
+};
+
+static FolderScore ScoreFolder(const std::wstring& normalizedPath,
+    const std::map<std::wstring, std::vector<std::wstring>>& signalMap);
+static void LogFolderScore(const FolderScore& fs);
+static void AddFolderOnly(const std::wstring& folder);
 
 // ---------------------------------------------------------------------------
 // Helper: case-insensitive wstring compare for set
@@ -206,25 +248,6 @@ std::wstring GetLogPath()
     dir += L"\\IntelligentSearchScopeExpander";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\source_log.txt";
-}
-
-// ---------------------------------------------------------------------------
-// Append a line to the log: "[timestamp] <source>: <folder>"
-// ---------------------------------------------------------------------------
-void LogFolderSource(const std::wstring& folder, const wchar_t* source)
-{
-    static std::mutex s_logMutex;
-    std::lock_guard<std::mutex> lock(s_logMutex);
-    FILE* f = nullptr;
-    _wfopen_s(&f, GetLogPath().c_str(), L"a, ccs=UTF-8");
-    if (!f) return;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fwprintf(f, L"[%04d-%02d-%02d %02d:%02d:%02d] %s: %s\n",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond,
-        source, folder.c_str());
-    fclose(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +768,306 @@ std::vector<TaggedPath> GetJumplistPaths()
 }
 
 // ---------------------------------------------------------------------------
+// Scoring: user-document file extensions (Rule 1)
+// ---------------------------------------------------------------------------
+static bool IsUserDocumentExt(const std::wstring& ext)
+{
+    static const wchar_t* s_exts[] = {
+        L".doc", L".docx", L".pdf", L".xls", L".xlsx",
+        L".ppt", L".pptx", L".txt", L".md", L".rtf",
+        L".csv", L".jpg", L".jpeg", L".png", L".mp4", L".mp3"
+    };
+    for (auto e : s_exts)
+        if (ext == e) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Scoring: project marker filenames (Rule 2)
+// ---------------------------------------------------------------------------
+static const wchar_t* FindProjectMarker(const std::wstring& folderPath)
+{
+    static const wchar_t* s_markers[] = {
+        L".git", L".sln", L".csproj", L"package.json",
+        L"Cargo.toml", L"Makefile", L"CMakeLists.txt",
+        L".xcodeproj", L"go.mod", L"pyproject.toml",
+        L"pom.xml", L"build.gradle"
+    };
+    for (auto m : s_markers)
+    {
+        std::wstring test = folderPath + L"\\" + m;
+        DWORD attr = GetFileAttributesW(test.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES)
+            return m;
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Scoring: check if path is under a user-content root (Rule 5)
+// ---------------------------------------------------------------------------
+static bool IsUnderUserContentRoot(const std::wstring& normalizedPath)
+{
+    // Under C:\Users\ (but not under AppData, which is already excluded)
+    return (normalizedPath.size() > 9 &&
+            normalizedPath.compare(0, 9, L"c:\\users\\") == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Recursive helper: count files, user-doc files, hidden/sys files, and
+// detect project markers across the folder and all its children.
+// ---------------------------------------------------------------------------
+struct FileCounts {
+    int totalFiles;
+    int userDocFiles;
+    int hiddenSysFiles;
+    bool hasProjectMarker;
+    std::wstring markerName;
+};
+
+static void EnumerateFilesRecursive(const std::wstring& dirPath, FileCounts& counts, int depth = 0)
+{
+    // Safety: cap depth to prevent runaway recursion
+    if (depth > 30) return;
+
+    // Check for project markers in this directory
+    if (!counts.hasProjectMarker)
+    {
+        const wchar_t* marker = FindProjectMarker(dirPath);
+        if (marker)
+        {
+            counts.hasProjectMarker = true;
+            counts.markerName = marker;
+        }
+    }
+
+    std::wstring searchPath = dirPath + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            // Recurse into child folders
+            std::wstring child = dirPath + L"\\" + fd.cFileName;
+            EnumerateFilesRecursive(child, counts, depth + 1);
+        }
+        else
+        {
+            counts.totalFiles++;
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) ||
+                (fd.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM))
+                counts.hiddenSysFiles++;
+            std::wstring name = ToLower(fd.cFileName);
+            size_t dotPos = name.find_last_of(L'.');
+            if (dotPos != std::wstring::npos)
+            {
+                std::wstring ext = name.substr(dotPos);
+                if (IsUserDocumentExt(ext))
+                    counts.userDocFiles++;
+            }
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+}
+
+// ---------------------------------------------------------------------------
+// Score a single folder against all rules
+// ---------------------------------------------------------------------------
+static FolderScore ScoreFolder(const std::wstring& normalizedPath,
+    const std::map<std::wstring, std::vector<std::wstring>>& signalMap)
+{
+    FolderScore fs = {};
+    fs.folder = normalizedPath;
+    fs.totalFiles = 0;
+    fs.userDocFiles = 0;
+    fs.hiddenSysFiles = 0;
+    fs.hasProjectMarker = false;
+    fs.isUnderUserRoot = false;
+    fs.accepted = false;
+    fs.recurseChildren = true;
+
+    // --- Enumerate files recursively across folder and all children ---
+    FileCounts counts = {};
+    EnumerateFilesRecursive(normalizedPath, counts);
+    fs.totalFiles = counts.totalFiles;
+    fs.userDocFiles = counts.userDocFiles;
+    fs.hiddenSysFiles = counts.hiddenSysFiles;
+    fs.hasProjectMarker = counts.hasProjectMarker;
+    fs.markerName = counts.markerName;
+
+    // --- Rule 1: User-Document File Ratio ---
+    fs.userDocPct = (fs.totalFiles > 0)
+        ? (100.0 * fs.userDocFiles / fs.totalFiles) : 0.0;
+    if (fs.userDocPct >= 30.0)
+        fs.rule1 = ScoreVerdict::NetPositive;
+    else
+        fs.rule1 = ScoreVerdict::Unsure;
+
+    // --- Rule 2: Project Marker Files ---
+    if (fs.hasProjectMarker)
+    {
+        fs.recurseChildren = false; // do NOT recurse into project folders
+    }
+
+    // --- Rule 3: Hidden/System File Ratio ---
+    fs.hiddenSysPct = (fs.totalFiles > 0)
+        ? (100.0 * fs.hiddenSysFiles / fs.totalFiles) : 0.0;
+    if (fs.hiddenSysPct >= 50.0)
+        fs.rule3 = ScoreVerdict::NetNegative;
+    else if (fs.hiddenSysPct >= 30.0)
+        fs.rule3 = ScoreVerdict::Unsure;
+    else
+        fs.rule3 = ScoreVerdict::NotApplicable;
+
+    // --- Rule 4: Signal Strength / Recurrence ---
+    auto it = signalMap.find(normalizedPath);
+    if (it != signalMap.end())
+    {
+        fs.signalSources = it->second;
+        // Count distinct source types
+        std::set<std::wstring> distinct(it->second.begin(), it->second.end());
+        fs.signalCount = (int)distinct.size();
+    }
+    else
+        fs.signalCount = 0;
+
+    if (fs.signalCount >= 3)
+        fs.rule4 = ScoreVerdict::NetPositive;
+    else if (fs.signalCount == 2)
+        fs.rule4 = ScoreVerdict::Unsure;
+    else
+        fs.rule4 = ScoreVerdict::NotApplicable;
+
+    // --- Rule 5: Under user-content root ---
+    fs.isUnderUserRoot = IsUnderUserContentRoot(normalizedPath);
+    fs.rule5 = fs.isUnderUserRoot ? ScoreVerdict::Unsure : ScoreVerdict::NotApplicable;
+
+    // --- Final Decision ---
+    // Any net-negative from Rule 3 rejects the folder
+    if (fs.rule3 == ScoreVerdict::NetNegative)
+    {
+        fs.accepted = false;
+        fs.reason = L"Rejected: Rule3 net-negative (hidden/sys ratio "
+            + std::to_wstring((int)fs.hiddenSysPct) + L"% >= 50%)";
+        return fs;
+    }
+
+    // Any net-positive accepts immediately
+    if (fs.rule1 == ScoreVerdict::NetPositive)
+    {
+        fs.accepted = true;
+        fs.reason = L"Accepted: Rule1 net-positive (user-doc ratio "
+            + std::to_wstring((int)fs.userDocPct) + L"% >= 30%)";
+        // Rule 4 net-positive + Rule 2 check: limit recursion
+        if (fs.rule4 == ScoreVerdict::NetPositive && fs.hasProjectMarker)
+            fs.recurseChildren = false;
+        return fs;
+    }
+    if (fs.rule4 == ScoreVerdict::NetPositive)
+    {
+        fs.accepted = true;
+        fs.reason = L"Accepted: Rule4 net-positive (" + std::to_wstring(fs.signalCount)
+            + L" distinct signal sources)";
+        if (fs.hasProjectMarker)
+            fs.recurseChildren = false;
+        return fs;
+    }
+
+    // Count unsure votes — need >=2 from different rules to accept
+    int unsureCount = 0;
+    if (fs.rule1 == ScoreVerdict::Unsure) unsureCount++;
+    if (fs.rule3 == ScoreVerdict::Unsure) unsureCount++;
+    if (fs.rule4 == ScoreVerdict::Unsure) unsureCount++;
+    if (fs.rule5 == ScoreVerdict::Unsure) unsureCount++;
+
+    if (unsureCount >= 2)
+    {
+        fs.accepted = true;
+        fs.reason = L"Accepted: " + std::to_wstring(unsureCount)
+            + L" unsure signals combined";
+        if (fs.hasProjectMarker)
+            fs.recurseChildren = false;
+        return fs;
+    }
+
+    // Project marker folder with at least 1 unsure — accept folder only
+    if (fs.hasProjectMarker && unsureCount >= 1)
+    {
+        fs.accepted = true;
+        fs.recurseChildren = false;
+        fs.reason = L"Accepted: project marker (" + fs.markerName
+            + L") + " + std::to_wstring(unsureCount) + L" unsure signal(s), no child recursion";
+        return fs;
+    }
+
+    fs.accepted = false;
+    fs.reason = L"Rejected: insufficient positive signals (unsure="
+        + std::to_wstring(unsureCount) + L")";
+    return fs;
+}
+
+// ---------------------------------------------------------------------------
+// Log detailed scoring results for a folder
+// ---------------------------------------------------------------------------
+static void LogFolderScore(const FolderScore& fs)
+{
+    static std::mutex s_logMutex;
+    std::lock_guard<std::mutex> lock(s_logMutex);
+    FILE* f = nullptr;
+    _wfopen_s(&f, GetLogPath().c_str(), L"a, ccs=UTF-8");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fwprintf(f, L"\n[%04d-%02d-%02d %02d:%02d:%02d] SCORING: %s\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+        fs.folder.c_str());
+    fwprintf(f, L"  Rule1 (User-Doc Ratio): %d/%d files = %.1f%% -> %s\n",
+        fs.userDocFiles, fs.totalFiles, fs.userDocPct, VerdictToString(fs.rule1));
+    fwprintf(f, L"  Rule2 (Project Marker): %s%s\n",
+        fs.hasProjectMarker ? L"YES" : L"NO",
+        fs.hasProjectMarker ? (L" (" + fs.markerName + L")").c_str() : L"");
+    fwprintf(f, L"  Rule3 (Hidden/Sys Ratio): %d/%d files = %.1f%% -> %s\n",
+        fs.hiddenSysFiles, fs.totalFiles, fs.hiddenSysPct, VerdictToString(fs.rule3));
+    fwprintf(f, L"  Rule4 (Signal Strength): %d distinct source(s)", fs.signalCount);
+    if (!fs.signalSources.empty())
+    {
+        fwprintf(f, L" [");
+        for (size_t i = 0; i < fs.signalSources.size(); i++)
+        {
+            if (i > 0) fwprintf(f, L", ");
+            fwprintf(f, L"%s", fs.signalSources[i].c_str());
+        }
+        fwprintf(f, L"]");
+    }
+    fwprintf(f, L" -> %s\n", VerdictToString(fs.rule4));
+    fwprintf(f, L"  Rule5 (User Content Root): %s -> %s\n",
+        fs.isUnderUserRoot ? L"YES" : L"NO", VerdictToString(fs.rule5));
+    fwprintf(f, L"  DECISION: %s | Recurse children: %s\n",
+        fs.accepted ? L"ACCEPTED" : L"REJECTED",
+        fs.recurseChildren ? L"YES" : L"NO");
+    fwprintf(f, L"  Reason: %s\n", fs.reason.c_str());
+    fclose(f);
+}
+
+// ---------------------------------------------------------------------------
+// Add a single folder (no children) to g_searchFolders
+// ---------------------------------------------------------------------------
+static void AddFolderOnly(const std::wstring& folder)
+{
+    std::wstring normalized = NormalizePath(folder);
+    if (normalized.empty()) return;
+    if (IsExcludedPath(normalized)) return;
+    if (!DirectoryExists(normalized)) return;
+    std::lock_guard<std::mutex> lock(g_folderMutex);
+    g_searchFolders.insert(normalized);
+}
+
+// ---------------------------------------------------------------------------
 // Add a folder and all its subfolders recursively
 // ---------------------------------------------------------------------------
 void AddFolderRecursive(const std::wstring& folder)
@@ -787,7 +1110,9 @@ void AddFolderRecursive(const std::wstring& folder)
 }
 
 // ---------------------------------------------------------------------------
-// Collect all search folders from all sources
+// Collect all search folders from all sources (two-phase scored approach)
+// Phase 1: Gather raw signal paths + build per-folder signal map
+// Phase 2: Score each candidate folder, log the decision, add if accepted
 // ---------------------------------------------------------------------------
 void CollectSearchFolders()
 {
@@ -806,33 +1131,56 @@ void CollectSearchFolders()
         return parent;
     };
 
-    auto addAndLog = [&](const std::wstring& rawPath, const wchar_t* source) {
+    // ---- Phase 1: Collect raw paths + build signal map ----
+    // signalMap: normalized folder path -> list of source tags
+    std::map<std::wstring, std::vector<std::wstring>> signalMap;
+
+    auto recordSignal = [&](const std::wstring& rawPath, const wchar_t* source) {
         std::wstring folder = getParentFolder(rawPath);
         if (folder.empty()) return;
         std::wstring norm = NormalizePath(folder);
-        {
-            std::lock_guard<std::mutex> lock(g_folderMutex);
-            if (g_searchFolders.count(norm)) return;
-        }
-        LogFolderSource(folder, source);
-        AddFolderRecursive(folder);
+        signalMap[norm].push_back(source);
     };
 
     // 1. File Explorer Recent / MRU
     auto mruPaths = GetRecentMRUPaths();
     for (auto& p : mruPaths)
-        addAndLog(p, L"FE MRU");
+        recordSignal(p, L"FE MRU");
 
     // 2. File Explorer folder jumplist / Quick Access
     auto folderPaths = GetExplorerFolderJumplistPaths();
     for (auto& p : folderPaths)
-        addAndLog(p, L"FE Folder Jumplist");
+        recordSignal(p, L"FE Folder Jumplist");
 
-    // 3. Application Jumplists (Word, Excel, PowerPoint, Notepad, etc.)
-    //    File Explorer jumplist entries are tagged as "FE Folder Jumplist"
+    // 3. Application Jumplists
     auto jlPaths = GetJumplistPaths();
     for (auto& tp : jlPaths)
-        addAndLog(tp.path, tp.source);
+        recordSignal(tp.path, tp.source);
+
+    // ---- Phase 2: Score each candidate folder ----
+    for (auto& kv : signalMap)
+    {
+        const std::wstring& norm = kv.first;
+
+        // Skip if already in our set from a previous run
+        {
+            std::lock_guard<std::mutex> lock(g_folderMutex);
+            if (g_searchFolders.count(norm)) continue;
+        }
+
+        if (!DirectoryExists(norm)) continue;
+
+        FolderScore fs = ScoreFolder(norm, signalMap);
+        LogFolderScore(fs);
+
+        if (fs.accepted)
+        {
+            if (fs.recurseChildren)
+                AddFolderRecursive(norm);
+            else
+                AddFolderOnly(norm);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
